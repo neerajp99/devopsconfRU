@@ -1,0 +1,75 @@
+# Configuration for Drift Remediation System
+# Used in presentation demo
+
+# AI Model Configuration
+ai:
+  detective_model: "gpt-4o"  # or claude-3.5-sonnet
+  surgeon_model: "gpt-4o"
+  checker_model: "gpt-4o"
+  temperature: 0.0  # Deterministic output
+  max_tokens: 2000
+
+# Agent Configuration
+agents:
+  max_retries: 3
+  timeout_seconds: 60
+  enable_self_correction: true
+
+# Validation Pipeline
+validation:
+  enable_terraform_validate: true
+  enable_terraform_plan: true
+  enable_opa_policy: true
+  opa_endpoint: "http://localhost:8181"
+
+# OPA Policy Tiers
+policy:
+  tier1:
+    auto_approve: true
+    environments: ["dev"]
+    max_risk_score: 0.5
+  tier2:
+    auto_approve: false
+    requires_review: true
+    environments: ["staging"]
+    max_risk_score: 0.7
+  tier3:
+    auto_approve: false
+    requires_approvers: 2
+    environments: ["prod"]
+    escalate_always: true
+
+# Circuit Breaker
+circuit_breaker:
+  enabled: true
+  failure_threshold: 0.5  # 50%
+  time_window_seconds: 3600  # 1 hour
+  min_attempts: 5
+  cooldown_minutes: 5
+
+# GitHub Integration
+github:
+  repo: "devopsconf/infrastructure-demo"
+  base_branch: "main"
+  auto_merge_tier1: true
+  auto_merge_tier2: false
+  auto_merge_tier3: false
+
+# Correlation Engine
+correlation:
+  time_window_hours: 1
+  enable_graph_analysis: true
+  noise_reduction_target: 0.85  # 85% reduction
+
+# Monitoring & Metrics
+monitoring:
+  enable_metrics: true
+  metrics_endpoint: "http://localhost:9090"
+  track_success_rate: true
+  alert_on_circuit_breaker: true
+
+# Demo Mode
+demo:
+  simulate_drift: true
+  mock_github_prs: true  # Don't create real PRs
+  verbose_logging: true

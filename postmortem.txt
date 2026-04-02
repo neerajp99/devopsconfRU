@@ -1,0 +1,349 @@
+INCIDENT POSTMORTEM REPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+INCIDENT ID:           INC-2025-03-14-0847
+DATE:                  2025-03-14 09:15:00 UTC
+SEVERITY:              P2 (High)
+STATUS:                Resolved
+RESOLUTION TIME:       19 hours
+
+SERVICE AFFECTED:      api.platform.example.com
+INFRASTRUCTURE:        aws_security_group.api_sg (sg-0abc123)
+EXPOSURE TYPE:         CIS 5.2 violation (SSH open to 0.0.0.0/0)
+INSTANCES AFFECTED:    2 EC2 instances (i-0abc123, i-0def456)
+
+TEAMS INVOLVED:        InfraOps, SecOps, NetOps
+TICKETS CREATED:       3 (INFRA-2847, SEC-9103, NET-4521)
+TICKETS CORRELATED:    0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TIMELINE
+
+T+0:00 (2025-03-13 14:00:00 UTC)
+  Developer makes Console change to sg-0abc123
+  Action: aws ec2 authorize-security-group-ingress
+  Change: Added ingress rule 0.0.0.0/0:22 (SSH world-open)
+  Context: "Just for quick debug"
+  Intent: Temporary access, planned to revert
+  Documentation: None (no ticket, no PR)
+
+T+0:04 (2025-03-13 14:04:00 UTC)
+  Terraform state polling detects drift (4-minute polling interval)
+  Detection system: terraform plan (scheduled via Jenkins)
+  Ticket created: INFRA-2847
+  Title: "sg-0abc123 CIDR changed"
+  Priority: MEDIUM
+  Assigned to: InfraOps queue
+  SLA: 4 hours
+  Context available: Terraform state diff only
+  Security implication: Not visible to detection system
+
+T+3:44 (2025-03-13 17:44:00 UTC)
+  CSPM scan completes (runs every 3 hours)
+  Detection system: Cloud Security Posture Management (AWS Security Hub)
+  Alert generated: "CIS 5.2 — SSH (port 22) open to 0.0.0.0/0"
+  Ticket created: SEC-9103
+  Priority: HIGH
+  Assigned to: SecOps queue
+  Context available: CIS benchmark violation, resource ID
+  Correlation: NONE (no link to INFRA-2847)
+  Investigation: Started fresh, no knowledge of existing InfraOps ticket
+
+T+4:00 (2025-03-13 18:00:00 UTC)
+  InfraOps closes INFRA-2847
+  Resolution: "No service impact detected"
+  Engineer reasoning: Terraform diff showed CIDR change only
+  Engineer action: Assumed legitimate infrastructure update
+  Root cause identified: NO (insufficient context)
+  Security team notified: NO (siloed ticketing system)
+
+  NOTE: InfraOps engineer followed standard procedure. The detection
+  system provided only infrastructure state diff, not security context.
+
+T+9:15 (2025-03-14 09:15:00 UTC)
+  NetOps morning routing review
+  Detection system: VPC flow log analysis (daily batch job)
+  Finding: Traffic anomaly on instances behind sg-0abc123
+  Observation: Unexpected SSH connection attempts from external IPs
+  Ticket created: NET-4521
+  Priority: MEDIUM
+  Assigned to: NetOps queue
+  Correlation: NONE (no link to INFRA-2847 or SEC-9103)
+
+  Cross-team investigation triggered
+  Correlation performed manually
+  Root cause identified: Console change at T+0:00
+  Remediation: Security group rule reverted
+
+  EXPOSURE WINDOW: 19 hours
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+IMPACT ANALYSIS
+
+SECURITY EXPOSURE:
+  - Duration: 19 hours
+  - Attack surface: Port 22 (SSH) exposed to entire internet
+  - Affected instances: 2 production EC2 instances
+  - Compliance violation: CIS AWS Foundations Benchmark 5.2
+  - Exploitation attempts: 147 SSH connection attempts from 23 unique IPs
+  - Successful intrusions: 0 (SSH key authentication prevented compromise)
+
+OPERATIONAL IMPACT:
+  - Service availability: No degradation
+  - Data breach: None detected
+  - Customer impact: None
+  - Business continuity: Not affected
+
+DETECTION PERFORMANCE:
+  - Time to detect (infrastructure): 4 minutes (Terraform polling)
+  - Time to detect (security): 3 hours 44 minutes (CSPM scan)
+  - Time to detect (network): 9 hours 15 minutes (VPC flow analysis)
+  - Time to correlate: 9 hours 15 minutes (manual cross-team investigation)
+  - Time to remediate: 19 hours
+
+TEAM INVOLVEMENT:
+  - InfraOps: Detected drift, closed as "no impact" (insufficient context)
+  - SecOps: Detected CIS violation, investigating independently
+  - NetOps: Detected anomaly, manually correlated to identify root cause
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ROOT CAUSE ANALYSIS
+
+IMMEDIATE CAUSE: Human console change
+
+Developer opened sg-0abc123 port 22 to 0.0.0.0/0 via AWS Console for debugging
+access. This created the security exposure (CIS 5.2 violation).
+
+Context: Legitimate debugging workflow, intended as temporary change, planned
+to revert after session. No malicious intent. No policy violation (Console
+access is permitted for authorized engineers).
+
+ROOT CAUSE OF 19-HOUR DELAY: System design failure
+
+The security exposure itself was human-caused. The 19-hour delay in fixing it
+was system-caused.
+
+Detection was fast (4 minutes). Remediation was slow (19 hours). The gap was
+not due to engineer negligence or slow response times. It was the inevitable
+result of architectural decisions in our detection and correlation systems.
+
+The question is not "Why did the developer open the port?"
+The question is "Why did it take 19 hours to fix what we detected in 4 minutes?"
+
+CONTRIBUTING FACTORS TO DELAY:
+
+1. SILOED DETECTION SYSTEMS
+   - Terraform polling: Detects infrastructure drift
+   - CSPM scanning: Detects security posture violations
+   - VPC flow logs: Detects network anomalies
+
+   Each system operates independently with separate alerting pipelines.
+   No shared context. No automatic correlation.
+
+2. CONTEXT LOSS ACROSS TOOLS
+   - Terraform sees: "ingress.cidr changed from 10.0.0.0/8 to 0.0.0.0/0"
+   - CSPM sees: "CIS 5.2 violation on sg-0abc123"
+   - VPC flow sees: "Anomalous SSH attempts on i-0abc123"
+
+   Same root cause, three separate observations, zero connection.
+
+3. TICKETING SYSTEM ISOLATION
+   - INFRA-2847: Created by Jenkins, assigned to InfraOps queue
+   - SEC-9103: Created by Security Hub, assigned to SecOps queue
+   - NET-4521: Created by VPC flow analyzer, assigned to NetOps queue
+
+   No cross-referencing. No shared incident ID. No composite view.
+
+4. DETECTION LATENCY VARIANCE
+   - Terraform: 4-minute polling (fast, but context-free)
+   - CSPM: 3-hour batch scan (delayed security visibility)
+   - VPC flow: Daily aggregation (slowest detection path)
+
+   First detection was infrastructure-only. Security detection came 3.6
+   hours later. By then, InfraOps had already closed their ticket.
+
+5. INSUFFICIENT OPERATIONAL CONTEXT
+   - InfraOps ticket showed state diff only (no security implication)
+   - SecOps ticket showed compliance violation only (no change history)
+   - NetOps ticket showed traffic anomaly only (no infrastructure link)
+
+   No single team had complete picture to assess criticality correctly.
+
+WHAT DIDN'T FAIL:
+  - Developer: Followed legitimate debugging workflow, intended to revert
+  - InfraOps engineer: Followed SLA, assessed available data correctly
+  - SecOps engineer: Triaged HIGH priority alert per standard procedure
+  - NetOps engineer: Identified anomaly during routine review
+  - Detection systems: All functioned as designed (Terraform, CSPM, VPC flow)
+
+WHAT DID FAIL:
+  - System architecture: Designed to produce isolated, uncorrelated alerts
+  - Correlation layer: Does not exist (manual discovery only)
+  - Shared context: No mechanism to connect infrastructure + security + network
+  - Drift attribution: No automated root cause analysis across domains
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHY THIS MATTERS
+
+This incident class represents a systemic gap in modern cloud operations:
+
+  "We can detect infrastructure drift in minutes,
+   but it takes hours to understand what it means."
+
+The InfraOps engineer wasn't wrong.
+The SecOps engineer wasn't wrong.
+The system was designed to produce this outcome.
+
+Three teams, three tickets, three separate investigations of the SAME event.
+Detection is fast. Correlation is manual. Context is lost.
+
+The operational question is not "Who missed this?"
+The operational question is "Why did the system require manual correlation?"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CORRECTIVE ACTIONS
+
+IMMEDIATE (Completed):
+  [✓] Reverted sg-0abc123 ingress rule to 10.0.0.0/8 (approved CIDR range)
+  [✓] Verified no successful intrusions during exposure window
+  [✓] Documented exposure in compliance audit log
+  [✓] Closed all three tickets with cross-references added manually
+
+SHORT-TERM (In Progress):
+  [ ] Implement correlated alerting for security group changes
+      Owner: Platform Engineering
+      Target: Q2 2025
+      Status: Design phase
+
+  [ ] Add security context to Terraform drift alerts
+      Owner: InfraOps + SecOps joint team
+      Target: Q2 2025
+      Status: POC scheduled
+
+  [ ] Reduce CSPM scan interval from 3 hours to 15 minutes
+      Owner: SecOps
+      Target: April 2025
+      Status: Vendor eval in progress
+
+LONG-TERM (Planned):
+  [ ] Multi-domain incident correlation system
+      Requirements:
+        - Ingest Terraform drift events (state changes)
+        - Ingest CSPM scan results (security posture)
+        - Ingest VPC flow log analysis (network behavior)
+        - Correlate by resource ID + time window
+        - Generate composite incident view
+        - Provide operational context (who, why, impact)
+
+      Owner: Platform Architecture
+      Target: Q3-Q4 2025
+      Status: RFC draft (see ARCH-489)
+
+  [ ] Automated drift remediation with guardrails
+      Requirements:
+        - Root cause analysis before remediation
+        - Risk scoring (low/medium/high)
+        - OPA policy evaluation (auto-merge vs review vs escalate)
+        - PR generation with full context
+        - Human approval for high-risk changes
+
+      Owner: Platform Engineering + AI Engineering
+      Target: Q4 2025
+      Status: Research phase
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LESSONS LEARNED
+
+1. Detection speed is not the bottleneck. Correlation is.
+
+   We detected the change in 4 minutes (Terraform polling). We detected the
+   security violation in 3.6 hours (CSPM scan). But correlation took 9+ hours
+   because it required manual cross-team investigation.
+
+2. Context matters more than velocity.
+
+   Fast detection without operational context produces low-priority tickets
+   that get closed prematurely. InfraOps saw a CIDR change. SecOps saw a CIS
+   violation. NetOps saw traffic anomaly. Nobody saw the full story.
+
+3. Siloed tools create siloed incidents.
+
+   Terraform, Security Hub, and VPC flow logs are excellent tools. But they
+   operate independently, producing separate alerts with no shared incident ID.
+   The correlation layer does not exist.
+
+4. This is a design problem, not a people problem.
+
+   Blaming the InfraOps engineer misses the point. They followed procedure,
+   assessed the data they had, and made a reasonable decision. The system
+   didn't give them the information needed to assess criticality correctly.
+
+5. The generation problem is solved. The operations problem is not.
+
+   We can generate infrastructure code perfectly (IaC, AI-assisted). We can
+   deploy it reliably (CI/CD, GitOps). But we cannot yet operate it with the
+   same level of automation and intelligence. Day 1 is solved. Day 2+ is not.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+METRICS
+
+INCIDENT METRICS:
+  - Time to detect (first system):        4 minutes
+  - Time to detect (security):            3 hours 44 minutes
+  - Time to correlate:                    9 hours 15 minutes
+  - Time to resolve:                      19 hours
+  - Number of teams involved:             3
+  - Number of tickets created:            3
+  - Number of tickets correlated:         0 (manual)
+
+EXPOSURE METRICS:
+  - SSH attempts during window:           147
+  - Unique source IPs:                    23
+  - Successful authentications:           0
+  - CIS benchmark violations:             1 (CIS 5.2)
+  - Compliance reporting required:        Yes (SOC2, quarterly audit)
+
+DETECTION SYSTEM PERFORMANCE:
+  - Terraform polling:                    ✓ Detected drift in 4 min
+  - CSPM scanning:                        ✓ Detected violation in 3.6 hr
+  - VPC flow analysis:                    ✓ Detected anomaly in 9.2 hr
+  - Correlation system:                   ✗ Does not exist
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+REFERENCES
+
+TICKETS:
+  - INFRA-2847: Terraform drift detection (closed prematurely)
+  - SEC-9103: CIS 5.2 violation (investigating independently)
+  - NET-4521: VPC flow anomaly (triggered manual correlation)
+
+RESOURCES:
+  - aws_security_group.api_sg (sg-0abc123)
+  - aws_instance.api_primary (i-0abc123)
+  - aws_instance.api_secondary (i-0def456)
+
+COMPLIANCE:
+  - CIS AWS Foundations Benchmark 5.2
+  - SOC2 Type II (quarterly audit reporting required)
+
+DOCUMENTATION:
+  - CloudTrail event: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+  - VPC flow logs: s3://vpc-flow-logs-prod/2025/03/13/
+  - CSPM scan report: security-hub-findings-2025-03-13-17-44.json
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+POSTMORTEM AUTHOR:       Platform Engineering (joint InfraOps/SecOps/NetOps)
+REVIEW STATUS:           Approved by Security, Compliance, and Engineering leads
+DISTRIBUTION:            Internal (all engineering, limited compliance/legal)
+NEXT REVIEW:             Q3 2025 (after correlation system implementation)
+
+END OF REPORT

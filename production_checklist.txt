@@ -1,0 +1,804 @@
+================================================================================
+PRODUCTION READINESS CHECKLIST: Autonomous Drift Remediation
+================================================================================
+
+Document Version:     2.1
+Last Updated:         2024-03-20
+Owned By:             Platform Team
+Review Cadence:       Quarterly (or after any P1 incident)
+Compliance Required:  YES (before enabling auto-merge in any environment)
+
+PURPOSE:
+  This checklist ensures safe deployment of autonomous drift remediation.
+  Each item exists because its absence caused a production incident.
+  This is not a theoretical list - it is lessons learned from real failures.
+
+SCOPE:
+  Applies to all environments where drift detection and remediation run:
+    - Development
+    - Staging
+    - Production
+
+USAGE:
+  - Complete ALL items before enabling auto-merge (risk < 0.3)
+  - Partial completion allows detection-only and PR generation modes
+  - Sign-off required from: Platform Lead, Security Lead, SRE Lead
+  - Store completed checklist in: docs/production-readiness/
+
+
+================================================================================
+PART 1: RISK MATRIX - AUTOMATION APPROPRIATENESS
+================================================================================
+
+The following matrix defines when automation is appropriate based on
+environment and resource criticality. Use this to set auto-merge thresholds
+and approval requirements in OPA policies.
+
+                        RESOURCE CRITICALITY
+                     LOW                    HIGH
+            ┌────────────────────┬────────────────────┐
+DEV /       │  [AUTO] FULL AUTO  │  [REVIEW] REQUIRED │
+STAGING     │  Auto-merge OK     │  PR + team review  │
+            ├────────────────────┼────────────────────┤
+PRODUCTION  │  [REVIEW] REQUIRED │  [MANUAL] ONLY     │
+            │  PR required       │  Mandatory human   │
+            └────────────────────┴────────────────────┘
+
+DEFINITIONS:
+
+  LOW CRITICALITY:
+    - Tags (Environment, Owner, CostCenter)
+    - Descriptions
+    - Non-functional attributes
+    - Monitoring configuration (CloudWatch, DataDog)
+    - S3 lifecycle policies (non-production buckets)
+    - Auto Scaling desired capacity (within bounds)
+
+  HIGH CRITICALITY:
+    - Databases (RDS, DynamoDB, Aurora)
+    - IAM roles and policies
+    - KMS encryption keys
+    - VPC networking (subnets, routing tables, peering)
+    - Security groups (ingress/egress rules)
+    - Secrets Manager entries
+    - Route53 DNS records (production zones)
+
+EXAMPLES:
+
+  [AUTO] Scenarios (auto-merge allowed):
+    - Tag drift on S3 bucket in dev environment
+    - Instance description changed in staging
+    - Non-critical attribute on EC2 in dev
+
+  [REVIEW] Scenarios (PR created, human approval required):
+    - Security group modification in production
+    - Instance type change in production
+    - S3 bucket policy drift in any environment
+
+  [MANUAL] Scenarios (PR created, human must manually apply):
+    - RDS instance configuration change (any environment)
+    - IAM role trust policy modification
+    - VPC routing table changes
+    - KMS key rotation settings
+
+
+================================================================================
+PART 2: MANDATORY PRE-PRODUCTION CHECKLIST
+================================================================================
+
+Complete ALL 10 items before enabling auto-merge functionality.
+If any item is incomplete, limit deployment to detection-only mode.
+
+Each checklist item includes:
+  - Requirement description
+  - Verification steps
+  - Incident reference (why this exists)
+  - Responsible team
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 1: Terraform State Locking Active
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  Terraform state must be stored remotely with locking enabled to prevent
+  concurrent modifications. Required backends:
+    - S3 + DynamoDB (lock table)
+    - Terraform Cloud (built-in locking)
+    - Terraform Enterprise (built-in locking)
+
+VERIFICATION STEPS:
+  [ ] Verify backend configuration in terraform block:
+      terraform {
+        backend "s3" {
+          bucket         = "terraform-state-prod"
+          key            = "infrastructure/terraform.tfstate"
+          region         = "us-east-1"
+          dynamodb_table = "terraform-locks"
+          encrypt        = true
+        }
+      }
+
+  [ ] Test lock acquisition:
+      Run: terraform plan
+      In separate terminal: terraform plan (should fail with lock error)
+
+  [ ] Verify lock table exists:
+      aws dynamodb describe-table --table-name terraform-locks
+
+  [ ] Confirm lock timeout is set (default: 10 minutes)
+
+WHY THIS EXISTS:
+  Without state locking, concurrent terraform apply operations corrupt state.
+  Drift remediation runs automatically - without locking, it will conflict
+  with manual terraform operations or other automation.
+
+INCIDENT REFERENCE:
+  INC-2024-0714: Two concurrent terraform applies corrupted state file,
+  required 3 hours to manually reconstruct state from AWS API.
+
+RESPONSIBLE TEAM: Platform Team
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 2: OPA Guardrails Deployed and Tested
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  OPA policies (tier1.rego, tier2.rego, tier3.rego) must be deployed to
+  CI/CD pipeline and tested with realistic deny scenarios. Policies must
+  enforce risk thresholds, critical resource protections, and incident guards.
+
+VERIFICATION STEPS:
+  [ ] Deploy OPA policies to GitHub Actions / Atlantis
+
+  [ ] Test auto-approve logic (tier1):
+      Create test drift with risk_score = 0.25, tag-only change
+      Verify OPA returns: auto_approve = true
+
+  [ ] Test critical resource block (tier2):
+      Create test drift for aws_db_instance
+      Verify OPA returns: deny["BLOCK: ..."]
+
+  [ ] Test active_incident guard (tier3):
+      Set active_incident = true in test input
+      Verify ALL auto-approvals blocked
+
+  [ ] Test destructive change block (tier3):
+      Set has_destructive_changes = true
+      Verify hard block with no override path
+
+  [ ] Verify OPA evaluation runs on:
+      - PR creation
+      - PR label changes
+      - Commit pushes
+
+WHY THIS EXISTS:
+  OPA is the last line of defense before auto-merge. Without working policies,
+  dangerous changes (database deletions, IAM escalations) can auto-merge.
+
+INCIDENT REFERENCE:
+  INC-2024-0801: OPA policy had syntax error (untested), auto-merge blocked
+  ALL changes for 6 hours including legitimate tag updates.
+
+RESPONSIBLE TEAM: Platform Team + Security Team
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 3: Incident Management Integration (PagerDuty/OpsGenie)
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  PagerDuty or OpsGenie must send real-time incident status to drift detection
+  system via webhook. When incident is declared, active_incident field must be
+  set to true in all DriftEvent objects. This prevents hotfix reversal.
+
+VERIFICATION STEPS:
+  [ ] Configure PagerDuty webhook:
+      Event: incident.triggered
+      Target: EventBridge → Lambda → DynamoDB state table
+
+  [ ] Configure Lambda function:
+      Function: pagerduty-incident-handler
+      Action: Set active_incident = true in drift-state table
+
+  [ ] Test incident flow:
+      1. Create test PagerDuty incident
+      2. Verify Lambda execution in CloudWatch Logs
+      3. Verify DynamoDB key: incident:active = true
+      4. Verify drift detection queries this key
+      5. Create test drift → verify auto-merge blocked
+
+  [ ] Test incident resolution:
+      1. Resolve PagerDuty incident
+      2. Verify Lambda clears active_incident flag
+      3. Verify auto-merge resumes for qualified drifts
+
+  [ ] Document override procedure:
+      If remediation needed during incident, incident commander
+      can add "incident/override" label with justification
+
+WHY THIS EXISTS:
+  During active incidents, SREs make emergency hotfixes via Console.
+  Without incident awareness, drift detection reverts these fixes,
+  extending incident duration.
+
+INCIDENT REFERENCE:
+  INC-2024-0892: Automated drift remediation reverted SRE's emergency
+  hotfix during P1, causing 22 additional minutes of downtime.
+  See: code/hotfix_reversal_incident.txt
+
+RESPONSIBLE TEAM: Platform Team + SRE Team
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 4: Circuit Breaker Active with Redis Backend
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  Circuit breaker must be deployed with Redis persistence to detect and prevent
+  infinite remediation loops. Redis must be highly available (multi-AZ or
+  ElastiCache cluster).
+
+VERIFICATION STEPS:
+  [ ] Deploy Redis instance:
+      Production: ElastiCache cluster (multi-AZ)
+      Staging: Single-node Redis (acceptable)
+
+  [ ] Configure circuit breaker:
+      WINDOW_SECONDS = 3600        # 1-hour window
+      MAX_REMEDIATIONS = 3         # Trip after 3 remediations
+      COOLDOWN_SECONDS = 1800      # 30-minute lockout
+      REDIS_HOST = elasticache-endpoint
+
+  [ ] Test loop detection:
+      python3 code/test_circuit_breaker.py
+      Verify circuit trips after 3 remediations
+
+  [ ] Test PagerDuty integration:
+      Trigger circuit trip
+      Verify PagerDuty alert sent (not Slack - requires action)
+
+  [ ] Verify Redis persistence:
+      Restart agent pods
+      Verify remediation counters persist (not reset)
+
+  [ ] Document manual reset procedure:
+      python -m core.circuit_breaker reset <resource_id> "reason"
+
+WHY THIS EXISTS:
+  Autoscaling policies or external automation can fight Terraform state,
+  creating infinite loops. Without circuit breaker, loops run for hours,
+  causing resource thrashing and cost overruns.
+
+INCIDENT REFERENCE:
+  Autoscaling vs Terraform loop ran 7 cycles in 1 hour before manual
+  intervention. Circuit breaker would have stopped after 3 cycles.
+
+RESPONSIBLE TEAM: Platform Team
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 5: Audit Logging for Every Agent Action
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  All agent actions (Detective analysis, Surgeon patch generation, Checker
+  validation, PR creation) must be logged to centralized audit system with:
+    - Structured JSON format
+    - Searchable by resource_id, event_id, actor
+    - Retention: 90 days minimum
+    - Integration with SIEM (Splunk, DataDog, CloudWatch Insights)
+
+VERIFICATION STEPS:
+  [ ] Configure structured logging:
+      Format: JSON
+      Fields: timestamp, level, agent, action, resource_id, event_id,
+              actor, risk_score, outcome, error (if any)
+
+  [ ] Verify log shipping:
+      Logs written to: stdout (Kubernetes) or CloudWatch
+      Shipped to: DataDog / Splunk / CloudWatch Insights
+
+  [ ] Test log queries:
+      Query 1: All actions for resource_id = "sg-0abc123"
+      Query 2: All Surgeon patches with risk_score > 0.8
+      Query 3: All Checker rejections (last 7 days)
+      Query 4: Timeline of actions for event_id = "evt-001"
+
+  [ ] Verify sensitive data redaction:
+      Logs must NOT contain:
+        - AWS credentials
+        - Secrets Manager values
+        - SSH keys
+        - Database passwords
+
+  [ ] Set up audit log alerts:
+      Alert on: High rejection rate (> 50%)
+      Alert on: Circuit breaker trips
+      Alert on: OPA hard blocks on critical resources
+
+WHY THIS EXISTS:
+  Autonomous systems require audit trails for:
+    - Incident investigation ("What did the agent do?")
+    - Compliance requirements (SOC2, ISO 27001)
+    - Debugging agent behavior
+    - Measuring effectiveness (approval rates, accuracy)
+
+INCIDENT REFERENCE:
+  During incident investigation, we had no visibility into why agent
+  generated a specific patch. Added comprehensive logging to reconstruct
+  decision timeline.
+
+RESPONSIBLE TEAM: Platform Team
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 6: Post-Apply Drift Verification Enabled
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  After terraform apply succeeds, re-check actual state to verify drift was
+  actually resolved. If drift persists, increment circuit breaker counter
+  (loop detection). If drift resolved, mark as successful.
+
+VERIFICATION STEPS:
+  [ ] Implement post-apply verification:
+      1. Terraform apply completes successfully
+      2. Wait 30 seconds (AWS eventual consistency)
+      3. Re-query actual state via boto3
+      4. Compare against desired state
+      5. If still drifted: record_remediation() for circuit breaker
+      6. If resolved: mark event as resolved
+
+  [ ] Test successful remediation:
+      Create test drift
+      Apply remediation
+      Verify post-check confirms resolution
+
+  [ ] Test persistent drift (loop scenario):
+      Create drift that auto-reverts (autoscaling)
+      Apply remediation
+      Verify post-check detects drift still exists
+      Verify circuit breaker counter incremented
+
+  [ ] Configure loop detection threshold:
+      After 3 failed remediations: trip circuit, page human
+
+WHY THIS EXISTS:
+  Without post-apply verification, we have no feedback on whether remediation
+  actually worked. Loops can continue silently without circuit breaker kicks in.
+
+INCIDENT REFERENCE:
+  Remediation applied successfully (terraform exit 0) but resource continued
+  to drift due to external automation. Took 4 cycles before manual detection.
+
+RESPONSIBLE TEAM: Platform Team
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 7: Rollback Runbook (Restore State in < 5 Minutes)
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  Documented, tested procedure to restore Terraform state to previous version
+  within 5 minutes. Required for emergency situations where agent makes
+  incorrect change.
+
+VERIFICATION STEPS:
+  [ ] Document rollback procedure:
+      Location: runbooks/drift-remediation-rollback.md
+
+      Steps:
+        1. Identify problematic commit SHA in terraform-state S3 bucket
+        2. Download previous state version:
+           aws s3api get-object-version --bucket terraform-state-prod \
+             --key infrastructure/terraform.tfstate --version-id <version>
+        3. Verify state integrity: terraform state list
+        4. Apply previous state: terraform apply -state=previous.tfstate
+        5. Verify resource restoration
+        6. Disable drift remediation: kubectl scale deployment/drift-agent --replicas=0
+
+  [ ] Test rollback procedure (in staging):
+      Create intentional bad change
+      Execute rollback runbook
+      Measure time to complete (must be < 5 minutes)
+
+  [ ] Train SRE team:
+      All on-call engineers must complete rollback drill
+      Quiz: "Agent made bad change, what do you do?"
+
+  [ ] Verify state backup retention:
+      S3 versioning enabled: YES
+      Retention: 30 days minimum
+      Backup frequency: After every terraform apply
+
+WHY THIS EXISTS:
+  Despite all safeguards, agents can make mistakes. Rollback capability is
+  the last line of defense. "Measure twice, cut once" - but have an undo button.
+
+INCIDENT REFERENCE:
+  Agent generated patch that passed all validations but caused service
+  degradation. Rollback took 18 minutes (too slow). Target: under 5 minutes.
+
+RESPONSIBLE TEAM: SRE Team + Platform Team
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 8: Alert Thresholds Tuned (< 50 Actionable Alerts per Day)
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  Drift detection alert volume must be tuned to < 50 actionable alerts per day.
+  Alert fatigue leads to teams ignoring ALL alerts, including critical ones.
+
+  Tuning mechanisms:
+    - Correlation (7 raw alerts → 1 incident)
+    - Severity-based routing
+    - Drift-ignore annotations
+    - Per-attribute cooldowns
+    - Rejection feedback loop
+
+VERIFICATION STEPS:
+  [ ] Measure baseline alert volume (before tuning):
+      Run detection for 7 days
+      Count daily alerts: raw alerts, correlated incidents
+      Target: Reduce to < 50/day
+
+  [ ] Enable correlation engine:
+      Same resource + 15-minute window → 1 alert
+      Verify: code/correlate.py
+      Expected reduction: 70-85%
+
+  [ ] Configure severity-based routing:
+      CRITICAL → PagerDuty (immediate)
+      HIGH → Slack #security-alerts (15-min SLA)
+      MEDIUM → Hourly digest email
+      LOW → Daily summary
+
+  [ ] Add drift-ignore annotations:
+      # drift-ignore: instance_type
+      # Reason: Managed by autoscaling policy
+      For attributes that drift intentionally
+
+  [ ] Implement per-attribute cooldowns:
+      First alert: immediate
+      Second alert (same attribute): include "REPEAT" flag
+      Third+ alerts: suppress for 24 hours, daily digest
+
+  [ ] Enable rejection feedback loop:
+      When human closes PR: parse rejection reason
+      Add resource+attribute to suppression list
+      Future drift on same attribute: suppressed
+
+  [ ] Measure tuned alert volume:
+      Run for 7 days post-tuning
+      Count daily alerts
+      Target achieved: < 50/day
+
+WHY THIS EXISTS:
+  First two weeks of drift detection: 900+ alerts/day. Team disabled
+  notifications and ignored system completely. Alert fatigue is worse than
+  no detection - creates false confidence while missing real incidents.
+
+INCIDENT REFERENCE:
+  Week 1: 847 alerts/day → team disabled Slack integration
+  Week 4 (tuned): 30 alerts/day → team responds to everything
+  Trust in signal is more important than volume of signal.
+
+RESPONSIBLE TEAM: Platform Team + All Engineering Teams
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 9: Auto-Merge Scoped to risk < 0.3 + Non-Critical Resources
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  Auto-merge must be limited to:
+    - Risk score < 0.3 (conservative threshold)
+    - Non-critical resource types only
+    - Development and staging environments preferred
+    - Tag-only changes in production (Tier 1)
+
+  All other changes require human review.
+
+VERIFICATION STEPS:
+  [ ] Configure OPA auto-merge threshold:
+      File: code/policies/tier1.rego
+      Rule: auto_approve { input.risk_score < 0.3 }
+
+      NOTE: Originally 0.6, lowered to 0.3 after incident analysis
+
+  [ ] Define critical resource types:
+      aws_db_instance, aws_rds_cluster
+      aws_iam_role, aws_iam_policy, aws_iam_user
+      aws_kms_key
+      aws_vpc, aws_subnet, aws_route_table
+      aws_secretsmanager_secret
+
+  [ ] Test auto-merge boundaries:
+      Test 1: risk_score = 0.25, non-critical → SHOULD auto-merge
+      Test 2: risk_score = 0.35, non-critical → SHOULD require review
+      Test 3: risk_score = 0.25, aws_db_instance → SHOULD require review
+      Test 4: risk_score = 0.25, tag-only, prod → SHOULD auto-merge
+
+  [ ] Monitor auto-merge rate:
+      Target: 40% of drift events auto-merge
+      If > 60%: threshold too permissive
+      If < 20%: threshold too conservative
+
+  [ ] Track false positive rate:
+      Auto-merged changes later reverted: < 2% acceptable
+      If > 5%: tighten threshold or improve Checker Agent
+
+WHY THIS EXISTS:
+  Original threshold (risk < 0.6) was too permissive. Analysis of 90 days
+  of drift events showed 35% in 0.3-0.6 range were borderline and should
+  require human review. Conservative threshold prevents automation mistakes.
+
+INCIDENT REFERENCE:
+  INC-2024-0892: Hotfix reversal incident occurred because risk_score = 0.55
+  was below 0.6 threshold. Post-incident: lowered to 0.3.
+
+RESPONSIBLE TEAM: Platform Team + Security Team
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+────────────────────────────────────────────────────────────────────────────
+ITEM 10: Kill Switch (Disable Agent in < 2 Minutes)
+────────────────────────────────────────────────────────────────────────────
+
+REQUIREMENT:
+  Ability to disable entire drift remediation system in under 2 minutes
+  during emergency situations. Multiple kill switch mechanisms required:
+    - Kubernetes deployment scaling
+    - Feature flag (immediate)
+    - OPA global deny rule
+
+VERIFICATION STEPS:
+  [ ] Implement Kubernetes kill switch:
+      Command: kubectl scale deployment/drift-agent --replicas=0
+      Verify: All agent pods terminate
+      Test time: < 30 seconds
+
+  [ ] Implement feature flag kill switch:
+      Flag: DRIFT_REMEDIATION_ENABLED
+      Location: ConfigMap or LaunchDarkly
+      Default: true
+      Effect: Set to false → agent stops processing events
+      Test time: < 10 seconds (config reload)
+
+  [ ] Implement OPA emergency deny:
+      Policy: code/policies/emergency.rego
+      Rule: deny[msg] { data.emergency_disable == true }
+      Set via: Update emergency_disable ConfigMap key
+      Effect: ALL remediations blocked
+      Test time: < 30 seconds
+
+  [ ] Document kill switch procedure:
+      Location: runbooks/drift-remediation-emergency-disable.md
+
+      Quick reference:
+        Method 1 (fastest): kubectl scale deployment/drift-agent --replicas=0
+        Method 2 (safer): kubectl set env deployment/drift-agent DRIFT_REMEDIATION_ENABLED=false
+        Method 3 (OPA): kubectl patch configmap opa-config --patch '{"data":{"emergency_disable":"true"}}'
+
+  [ ] Test kill switch drill:
+      Scenario: "Agent is misbehaving, disable immediately"
+      Measure time to complete
+      Target: < 2 minutes
+
+  [ ] Train on-call engineers:
+      All SREs must know kill switch procedure
+      Include in on-call handbook
+
+WHY THIS EXISTS:
+  Despite all safeguards, unforeseen scenarios occur. Kill switch provides
+  immediate stop button when agent behavior is unexpected or dangerous.
+  Better to disable and investigate than allow continued autonomous operation.
+
+INCIDENT REFERENCE:
+  During hotfix reversal incident, on-call engineer needed 4 minutes to
+  disable agent (no documented procedure). Target: under 2 minutes with
+  clear runbook.
+
+RESPONSIBLE TEAM: SRE Team + Platform Team
+
+SIGN-OFF: _________________________  DATE: __________
+
+
+================================================================================
+PART 3: PHASED ROLLOUT APPROACH
+================================================================================
+
+If checklist is not 100% complete, use phased rollout to gain value safely:
+
+PHASE 1: DETECTION ONLY (Items 1, 5 required minimum)
+  - Enable drift detection and correlation
+  - Generate alerts only (no remediation)
+  - Value: Visibility into drift volume and patterns
+  - Risk: None (read-only)
+
+PHASE 2: DETECTIVE AGENT (Items 1, 2, 5 required)
+  - Enable Detective Agent for root cause analysis
+  - Generate RCA reports, no automated patches
+  - Value: Understand WHO, WHAT, WHY for each drift
+  - Risk: Minimal (still read-only)
+
+PHASE 3: SURGEON PR GENERATION (Items 1, 2, 4, 5, 7 required)
+  - Enable Surgeon Agent to generate remediation patches
+  - Create GitHub PRs, no auto-merge
+  - ALL PRs require human review and merge
+  - Value: Save engineering time (patches generated, not manual)
+  - Risk: Low (human reviews every change)
+
+PHASE 4: LIMITED AUTO-MERGE (ALL 10 items required)
+  - Enable auto-merge for low-risk changes only:
+      risk_score < 0.3
+      Non-critical resources
+      Development and staging environments
+      Tag-only changes in production
+  - All other changes still require review
+  - Value: 40% of drift auto-remediated
+  - Risk: Medium (requires all safeguards)
+
+PHASE 5: EXPANDED AUTO-MERGE (After 90 days success in Phase 4)
+  - Increase risk threshold to 0.4 (if false positive rate < 2%)
+  - Enable auto-merge in production for specific resource types
+  - Continue requiring review for critical resources
+  - Value: 50-60% of drift auto-remediated
+  - Risk: Medium-High (close monitoring required)
+
+ROLLBACK CRITERIA (Return to Previous Phase):
+  - Any P1 incident caused by agent
+  - False positive rate > 5%
+  - Circuit breaker trips > 3 per week
+  - Team trust score < 70% (quarterly survey)
+
+
+================================================================================
+PART 4: SIGN-OFF AND APPROVALS
+================================================================================
+
+This checklist must be completed and signed by all stakeholders before
+enabling auto-merge (Phase 4) in any environment.
+
+PLATFORM TEAM LEAD:
+  Name: _________________________
+  Signature: _________________________
+  Date: __________
+  Confirmation: All 10 checklist items verified complete
+
+SECURITY TEAM LEAD:
+  Name: _________________________
+  Signature: _________________________
+  Date: __________
+  Confirmation: OPA policies reviewed and approved
+
+SRE TEAM LEAD:
+  Name: _________________________
+  Signature: _________________________
+  Date: __________
+  Confirmation: Rollback and kill switch procedures tested
+
+ENGINEERING DIRECTOR:
+  Name: _________________________
+  Signature: _________________________
+  Date: __________
+  Confirmation: Risk acceptance for autonomous remediation
+
+
+================================================================================
+PART 5: POST-DEPLOYMENT MONITORING
+================================================================================
+
+After enabling auto-merge, monitor these metrics weekly:
+
+HEALTH METRICS:
+  - Auto-merge approval rate (target: 35-45%)
+  - False positive rate (target: < 2%)
+  - Circuit breaker trips (target: < 1 per week)
+  - Rollback frequency (target: 0)
+  - Mean time to remediation (target: < 10 minutes for auto-merge)
+
+QUALITY METRICS:
+  - Checker Agent rejection rate (target: 20-30%)
+  - Surgeon self-correction success rate (target: > 90% after 3 attempts)
+  - OPA policy block rate (target: 5-10%)
+  - Human PR approval time (target: < 4 hours)
+
+OPERATIONAL METRICS:
+  - Alert volume (target: < 50 actionable alerts per day)
+  - Team trust score (target: > 80% on quarterly survey)
+  - Incident count (target: 0 agent-caused incidents)
+  - Time saved (target: > 15 engineering hours per week)
+
+REVIEW CADENCE:
+  - Daily: Review circuit breaker trips and OPA blocks
+  - Weekly: Review metrics dashboard with Platform Team
+  - Monthly: Review incidents and near-misses with all stakeholders
+  - Quarterly: Update checklist based on lessons learned
+
+
+================================================================================
+APPENDIX A: INCIDENT REFERENCES
+================================================================================
+
+This section documents incidents that led to checklist items.
+When adding new items, reference the incident that motivated it.
+
+INC-2024-0714: Terraform State Corruption
+  - Cause: Concurrent terraform applies without state locking
+  - Impact: 3 hours to reconstruct state manually
+  - Led to: Checklist Item 1 (state locking required)
+
+INC-2024-0801: OPA Policy Syntax Error
+  - Cause: OPA policy deployed without testing
+  - Impact: All auto-merges blocked for 6 hours
+  - Led to: Checklist Item 2 (test policies with deny scenarios)
+
+INC-2024-0892: Hotfix Reversal During P1
+  - Cause: No incident management integration (active_incident field missing)
+  - Impact: 22 additional minutes of P1 downtime
+  - Led to: Checklist Item 3 (PagerDuty integration required)
+  - See: code/hotfix_reversal_incident.txt
+
+LOOP-2024-Q3: Autoscaling vs Terraform Loop
+  - Cause: No circuit breaker, loop ran 7 cycles undetected
+  - Impact: Resource thrashing, $400 compute waste
+  - Led to: Checklist Item 4 (circuit breaker with Redis required)
+
+
+================================================================================
+APPENDIX B: RELATED DOCUMENTS
+================================================================================
+
+Architecture Decision Records:
+  - ADR-0034: Incident-Aware Remediation (active_incident field)
+  - ADR-0041: Maker-Checker Pattern for Agent Design
+  - ADR-0048: Circuit Breaker for Loop Prevention
+
+Runbooks:
+  - runbooks/drift-remediation-rollback.md
+  - runbooks/drift-remediation-emergency-disable.md
+  - runbooks/circuit-breaker-reset.md
+
+Policy Files:
+  - code/policies/tier1.rego (auto-merge rules)
+  - code/policies/tier2.rego (human review rules)
+  - code/policies/tier3.rego (hard blocks)
+
+Code References:
+  - code/core/circuit_breaker.py (loop detection)
+  - code/core/schemas.py (DriftEvent.active_incident field)
+  - code/correlate.py (alert deduplication)
+  - code/hotfix_reversal_incident.txt (why active_incident exists)
+
+
+================================================================================
+END OF CHECKLIST
+================================================================================
+
+Version History:
+  v1.0 (2024-01-15): Initial checklist (8 items)
+  v2.0 (2024-03-16): Added Item 3 (incident integration) after INC-2024-0892
+  v2.1 (2024-03-20): Added Item 4 (circuit breaker) after autoscaling loop
+
+Next Review: 2024-06-20 (quarterly)

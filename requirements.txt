@@ -1,0 +1,38 @@
+# AI & LLM Libraries
+openai>=1.0.0
+anthropic>=0.18.0
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langgraph>=0.0.20
+
+# Data Validation
+pydantic>=2.0.0
+
+# Graph & Correlation
+networkx>=3.0
+matplotlib>=3.7.0
+numpy>=1.24.0
+
+# Causal Inference (PC Algorithm - Slide 8)
+causal-learn>=0.1.4      # PyWhy project - implements PC Algorithm
+                         # Falls back to heuristic if not installed
+
+# GitHub Integration
+PyGithub>=2.1.1
+
+# Terraform Integration (optional - for real validation)
+python-terraform>=0.10.1
+
+# OPA Integration (optional)
+requests>=2.31.0
+
+# AWS Integration
+boto3>=1.28.0           # AWS SDK for CloudTrail, state lookups
+botocore>=1.31.0        # Low-level AWS SDK
+
+# Circuit Breaker (Slide 24)
+redis>=5.0.0            # Redis client for circuit breaker state
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0
